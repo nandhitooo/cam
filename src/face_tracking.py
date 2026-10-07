@@ -37,7 +37,8 @@ GLASSES_COLOR = (18, 18, 18)
 
 def default_model_path() -> str:
     """Path of the bundled YuNet model."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", MODEL_FILENAME)
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(package_dir, "models", MODEL_FILENAME)
 
 
 class ModelMissingError(FileNotFoundError):

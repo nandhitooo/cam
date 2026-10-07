@@ -1,4 +1,4 @@
-"""Non-blocking camera reader.
+"""Non-blocking camera reader used by the webcam application.
 
 Reading a frame inline (read -> filter -> draw -> show) makes the preview fall
 further and further behind reality whenever a filter is expensive: while the

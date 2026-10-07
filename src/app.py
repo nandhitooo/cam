@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real-time webcam filter app.
+"""Application entry point for the real-time webcam filter app.
 
 Reads frames from a camera with OpenCV, applies one of several artistic
 filters in real time, and shows the result in a window. Filters can be
@@ -11,14 +11,15 @@ Frames are grabbed on a background thread, so a slow filter drops frames
 instead of falling behind the camera.
 
 Usage:
-    python webcam_filters.py                 # default camera, 1280x720
-    python webcam_filters.py --camera 1      # pick another device
-    python webcam_filters.py --width 640 --height 480
-    python webcam_filters.py --filter cartoon
-    python webcam_filters.py --face-effect glasses   # start with sunglasses
-    python webcam_filters.py --face-zoom             # start in face-cam mode
-    python webcam_filters.py --list-filters
-    python webcam_filters.py --self-test     # verify filters + face code, no camera
+    python main.py                 # default camera, 1280x720
+    python main.py --camera 1      # pick another device
+    python main.py --width 640 --height 480
+    python main.py --filter cartoon
+    python main.py --face-effect glasses   # start with sunglasses
+    python main.py --face-zoom             # start in face-cam mode
+    python main.py --face-attributes       # start with age/expression labels
+    python main.py --list-filters
+    python main.py --self-test     # verify filters + face code, no camera
 """
 
 from __future__ import annotations
@@ -34,8 +35,9 @@ from typing import Callable
 import cv2
 import numpy as np
 
-import face_tracking as ft
-from threaded_camera import ThreadedCamera
+from . import face_attributes as fa
+from . import face_tracking as ft
+from .threaded_camera import ThreadedCamera
 
 Frame = np.ndarray
 FilterFn = Callable[[Frame], Frame]
@@ -331,8 +333,8 @@ def open_camera(camera: int, width: int, height: int) -> cv2.VideoCapture:
 
 
 HINT = (
-    "n/p or arrows: filter   v: face mode   z: face zoom   s: snapshot   "
-    "m: mirror   h: hide   f: fullscreen   q: quit"
+    "n/p or arrows: filter   v: face mode   z: face zoom   a: age/expression   "
+    "s: snapshot   m: mirror   h: hide   f: fullscreen   q: quit"
 )
 
 
@@ -347,6 +349,18 @@ def load_tracker(args: argparse.Namespace) -> ft.FaceTracker | None:
     except ft.ModelMissingError as exc:
         print(f"warning: face features are disabled.\n{exc}", file=sys.stderr)
         return None
+
+
+def load_attributes(args: argparse.Namespace) -> fa.AttributeEstimator:
+    """Build the age/expression estimator, reporting whichever model is unavailable."""
+    estimator = fa.AttributeEstimator(
+        expression_model_path=args.expression_model,
+        age_model_path=args.age_model,
+        every_n=args.face_attr_every,
+    )
+    for warning in estimator.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return estimator
 
 
 def run(args: argparse.Namespace) -> int:
@@ -365,9 +379,12 @@ def run(args: argparse.Namespace) -> int:
     fullscreen = args.fullscreen
     effect_index = ft.FACE_EFFECTS.index(args.face_effect)
     face_zoom = args.face_zoom
+    face_labels = args.face_attributes
     tracker: ft.FaceTracker | None = None
     tracker_unavailable = False
     faces: list[ft.Face] = []
+    attributes: list[fa.FaceAttributes] = []
+    attributes_estimator = load_attributes(args)
     snapshot_dir = os.path.abspath(args.snapshot_dir)
     os.makedirs(snapshot_dir, exist_ok=True)
 
@@ -379,6 +396,11 @@ def run(args: argparse.Namespace) -> int:
     print(f"camera {args.camera} opened - {len(FILTERS)} filters available")
     print(f"capture: {'background thread' if camera.threaded else 'inline'}")
     print(f"face: mode={ft.FACE_EFFECTS[effect_index]}  zoom={'on' if face_zoom else 'off'}")
+    print(
+        f"attributes: labels={'on' if face_labels else 'off'}  "
+        f"expression={'on' if attributes_estimator.expression_enabled else 'off'}  "
+        f"age={'on' if attributes_estimator.age_enabled else 'off'}"
+    )
     print(HINT)
     print(f"snapshots -> {snapshot_dir}")
 
@@ -403,7 +425,7 @@ def run(args: argparse.Namespace) -> int:
                 continue
 
             effect = ft.FACE_EFFECTS[effect_index]
-            if effect != "off" or face_zoom:
+            if effect != "off" or face_zoom or face_labels:
                 if tracker is None and not tracker_unavailable:
                     tracker = load_tracker(args)
                     tracker_unavailable = tracker is None
@@ -413,13 +435,17 @@ def run(args: argparse.Namespace) -> int:
                     except cv2.error as exc:
                         print(f"warning: face tracking failed ({exc}); disabled", file=sys.stderr)
                         tracker, tracker_unavailable, faces = None, True, []
-                # Draw the effect first, then crop: both then share one coordinate space.
+                attributes = attributes_estimator.update(frame, faces) if faces else []
+                # Draw the overlays first, then crop: all then share one coordinate space.
                 if faces:
                     frame = ft.apply_face_effect(frame, faces, effect)
+                    if face_labels:
+                        frame = fa.draw_face_attributes(frame, faces, attributes)
                     if face_zoom:
                         frame = ft.zoom_to_face(frame, faces)
             else:
                 faces = []
+                attributes = []
 
             now = time.perf_counter()
             delta = now - previous
@@ -428,10 +454,13 @@ def run(args: argparse.Namespace) -> int:
                 fps = 0.9 * fps + 0.1 * (1.0 / delta)
 
             face_status = ""
-            if effect != "off" or face_zoom:
+            if effect != "off" or face_zoom or face_labels:
                 face_status = f"faces: {len(faces)}   mode: {effect}"
                 if face_zoom:
                     face_status += "   zoom: ON"
+                if face_labels:
+                    summary = attributes[0].label() if attributes else ""
+                    face_status += f"   attr: {summary or 'n/a'}"
             display = (
                 draw_hud(frame, index, fps, mirrored, HINT, face_status) if hud_visible else frame
             )
@@ -454,6 +483,9 @@ def run(args: argparse.Namespace) -> int:
             elif key == ord("z"):
                 face_zoom = not face_zoom
                 print(f"face zoom: {'on' if face_zoom else 'off'}")
+            elif key == ord("a"):
+                face_labels = not face_labels
+                print(f"age/expression labels: {'on' if face_labels else 'off'}")
             elif key == ord("m"):
                 mirrored = not mirrored
             elif key == ord("h"):
@@ -603,7 +635,7 @@ def _face_self_test(failures: list[str]) -> None:
 def _face_tracker_self_test(check) -> None:
     """Exercise FaceTracker's matching, smoothing and retirement with injected
 detections, so the tracking logic is covered even without a real face."""
-    missing = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "definitely-not-here.onnx")
+    missing = os.path.join(os.path.dirname(ft.default_model_path()), "definitely-not-here.onnx")
     try:
         ft.FaceTracker(missing)
         check("FaceTracker rejects a missing model", False, "no exception raised")
@@ -656,6 +688,142 @@ detections, so the tracking logic is covered even without a real face."""
     check("tracker retires the face that stayed gone", all(t.id != 1 for t in tracker.tracks), str([(t.id, t.missed) for t in tracker.tracks]))
     check("tracker gives a new face elsewhere a new id", any(t.id != 1 and np.allclose(t.box, far) for t in tracker.tracks), str([t.id for t in tracker.tracks]))
     check("tracker throttles detection to every Nth frame", tracker.detect_runs == 7, str(tracker.detect_runs))
+
+
+def _face_attributes_self_test(failures: list[str]) -> None:
+    """Exercise the age/expression code - alignment, decoders, throttle, drawing."""
+    print("\nface attributes (synthetic geometry, no camera)")
+
+    def check(name: str, condition: bool, detail: str = "") -> None:
+        print(f"  {'PASS' if condition else 'FAIL'}  {name}" + (f"  -> {detail}" if detail and not condition else ""))
+        if not condition:
+            failures.append(f"attributes: {name} {detail}".strip())
+
+    # -- decoders ---------------------------------------------------------
+    probabilities = fa.softmax(np.array([0.0, 1.0, 2.0], np.float32))
+    check("softmax sums to one", abs(float(probabilities.sum()) - 1.0) < 1e-6, str(probabilities.sum()))
+    check("softmax is monotone in the logits", bool((np.diff(probabilities) > 0).all()))
+    check("softmax survives huge logits", np.isfinite(fa.softmax(np.array([1e4, -1e4], np.float32))).all())
+
+    logits = np.array([[0.0, 0.0, 0.0, 6.0, 1.0, 0.0, 0.0]], np.float32)
+    expression, confidence, scores = fa.decode_expression(logits)
+    check("decode_expression names the argmax class", expression == "happy", expression)
+    check("decode_expression agrees with a raw argmax", int(scores.argmax()) == int(logits.argmax()))
+    check("decode_expression reports the peak as confidence", abs(confidence - float(scores.max())) < 1e-6)
+
+    bins = np.full(100, -20.0, np.float32)
+    bins[40] = 20.0
+    age, age_confidence = fa.decode_age(bins)
+    expected = float((fa.softmax(bins) * np.arange(100)).sum())
+    check("decode_age turns 100 bins into the expected age", abs(age - expected) < 1e-3, f"{age} vs {expected}")
+    check("decode_age reports the peak bin as confidence", 0.5 < age_confidence <= 1.0, str(age_confidence))
+    check("decode_age reads a single value as a 0..1 age", fa.decode_age(np.array([[0.42]], np.float32))[0] == 42.0)
+    check("decode_age rejects an unexpected shape", fa.decode_age(np.zeros(7, np.float32))[0] is None)
+
+    # -- alignment --------------------------------------------------------
+    angle = np.deg2rad(20.0)
+    rotation = np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]], np.float32
+    ) * 1.7
+    # Landmarks built from the template by a known similarity must map back onto it.
+    landmarks = (fa.ALIGN_TEMPLATE @ rotation.T + np.array([60.0, 40.0], np.float32)).astype(np.float32)
+    matrix = fa.similarity_transform(landmarks, fa.ALIGN_TEMPLATE)
+    remapped = np.c_[landmarks, np.ones(5, np.float32)] @ matrix.T
+    error = float(np.abs(remapped - fa.ALIGN_TEMPLATE).max())
+    check("similarity_transform is the inverse of a known similarity", error < 0.5, f"max err {error:.3f}px")
+
+    dotted = np.zeros((240, 320, 3), np.uint8)
+    for point in landmarks.astype(int):
+        cv2.circle(dotted, (int(point[0]), int(point[1])), 2, (255, 255, 255), -1)
+    aligned = fa.align_face(dotted, landmarks)
+    check("align_face returns a 112x112 uint8 crop", aligned.shape == (112, 112, 3) and aligned.dtype == np.uint8)
+    landed = all(
+        aligned[int(point[1]) - 3 : int(point[1]) + 4, int(point[0]) - 3 : int(point[0]) + 4, 0].max() > 128
+        for point in fa.ALIGN_TEMPLATE
+    )
+    check("align_face puts the landmarks on the alignment template", landed)
+
+    centred = np.zeros((240, 320, 3), np.uint8)
+    cv2.circle(centred, (140, 105), 3, (255, 255, 255), -1)  # centre of the box below
+    age_crop = fa.crop_for_age(centred, np.array([100.0, 60.0, 80.0, 90.0], np.float32))
+    check("crop_for_age returns the model's input size", age_crop.shape == (224, 224, 3))
+    ys, xs = np.where(age_crop[..., 0] > 128)
+    centroid = (float(xs.mean()), float(ys.mean())) if len(xs) else (-1.0, -1.0)
+    check(
+        "crop_for_age centres the face box on the crop",
+        abs(centroid[0] - 112.0) < 3.0 and abs(centroid[1] - 112.0) < 3.0,
+        f"centroid {centroid[0]:.1f},{centroid[1]:.1f}",
+    )
+
+    # -- estimator --------------------------------------------------------
+    placeholder_estimator = fa.AttributeEstimator(expression_model_path=os.path.join("src", "models", "nope.onnx"))
+    check("a missing model disables only that attribute", not placeholder_estimator.enabled)
+    check("a missing model explains how to fetch it", any("curl" in w for w in placeholder_estimator.warnings))
+    frame = np.full((240, 320, 3), 90, np.uint8)
+    face = ft.Face(1, np.array([100.0, 60.0, 80.0, 90.0], np.float32), 0.9,
+                   (fa.ALIGN_TEMPLATE + np.array([60.0, 40.0], np.float32)).astype(np.float32))
+    idle = placeholder_estimator.update(frame, [face])[0]
+    check("a disabled estimator renders an empty label", idle.label(show_age=True, show_expression=True) == "")
+    check("a disabled estimator still returns one entry per face", len(placeholder_estimator.update(frame, [face])) == 1)
+    check("the estimator is a no-op on an empty face list", placeholder_estimator.update(frame, []) == [])
+
+    class FakeAgeNet:
+        """Stands in for an age model so the age plumbing is covered without one."""
+
+        def __init__(self, output: np.ndarray) -> None:
+            self.output = output
+            self.blobs: list[tuple[int, ...]] = []
+
+        def setInput(self, blob: np.ndarray) -> None:
+            self.blobs.append(tuple(int(v) for v in blob.shape))
+
+        def forward(self) -> np.ndarray:
+            return self.output
+
+    age_estimator = fa.AttributeEstimator(expression_model_path=os.path.join("src", "models", "nope.onnx"))
+    fake_age = FakeAgeNet(np.array([[0.34]], np.float32))
+    age_estimator._age_net = fake_age
+    check("an age model alone enables the estimator", age_estimator.enabled)
+    aged = age_estimator.update(frame, [face])[0]
+    check("the age path decodes a normalised regression output", aged.age == 34.0, str(aged.age))
+    check("the age path feeds a 1x3x224x224 blob", fake_age.blobs == [(1, 3, 224, 224)], str(fake_age.blobs))
+    check("the age path renders an age-only label", aged.label(show_expression=False) == "~34y", aged.label())
+    check("the age path leaves the expression unknown", aged.expression == "unknown")
+
+    if not os.path.exists(fa.default_expression_model_path()):
+        print(f"  SKIP  expression model tests (not present: {fa.default_expression_model_path()})")
+    else:
+        estimator = fa.AttributeEstimator(every_n=2)
+        check("the bundled expression model loads", estimator.expression_enabled)
+        first = estimator.update(frame, [face])[0]
+        check("the expression model returns a known class", first.expression in fa.EXPRESSIONS, first.expression)
+        check("the expression scores sum to one", abs(float(first.expression_scores.sum()) - 1.0) < 1e-5)
+        check("the expression model ran once", estimator.expression_runs == 1, str(estimator.expression_runs))
+        cached = estimator.update(frame, [face])[0]
+        check("the throttled call reuses the cached result", estimator.expression_runs == 1)
+        check("the throttled call still reports the label", cached.expression == first.expression)
+        estimator.update(frame, [face])
+        check("the model runs again on the next refresh tick", estimator.expression_runs == 2, str(estimator.expression_runs))
+        tiny_estimator = fa.AttributeEstimator(every_n=1)
+        tiny = ft.Face(2, np.array([0.0, 0.0, 4.0, 4.0], np.float32), 0.5, fa.ALIGN_TEMPLATE)
+        tiny_attrs = tiny_estimator.update(frame, [tiny])[0]
+        check(
+            "a tiny face skips the model entirely",
+            tiny_attrs.expression == "unknown" and tiny_estimator.expression_runs == 0,
+            f"expression={tiny_attrs.expression} runs={tiny_estimator.expression_runs}",
+        )
+        estimator.update(frame, [])  # a face that left must drop out of the cache
+        check("a departed face leaves no cached entry", estimator._cache == {})
+
+    # -- drawing ----------------------------------------------------------
+    tagged = fa.FaceAttributes(age=34.0, expression="happy", expression_confidence=0.8)
+    check("the label carries age and expression", tagged.label() == "~34y  happy 0.80", tagged.label())
+    check("the label can hide either half", tagged.label(show_age=False) == "happy 0.80" and tagged.label(show_expression=False) == "~34y")
+    check("an empty label hides everything", fa.FaceAttributes().label() == "")
+    check("drawing with no faces is a no-op", np.array_equal(fa.draw_face_attributes(frame, [], []), frame))
+    drawn = fa.draw_face_attributes(frame, [face], [tagged])
+    check("drawing tags the frame", drawn.shape == frame.shape and drawn.dtype == np.uint8 and not np.array_equal(drawn, frame))
+    check("drawing stays inside a 1px-tall frame", fa.draw_face_attributes(np.full((1, 1, 3), 90, np.uint8), [face], [tagged]).shape == (1, 1, 3))
 
 
 def _camera_self_test(failures: list[str]) -> None:
@@ -763,6 +931,7 @@ def self_test() -> int:
 
     print("-" * 46)
     _face_self_test(failures)
+    _face_attributes_self_test(failures)
     _camera_self_test(failures)
 
     if failures:
@@ -770,7 +939,7 @@ def self_test() -> int:
         for failure in failures:
             print(f"  - {failure}")
         return 1
-    print(f"\nSELF-TEST PASSED ({len(FILTERS)} filters, face effects, camera reader)")
+    print(f"\nSELF-TEST PASSED ({len(FILTERS)} filters, face effects, face attributes, camera reader)")
     return 0
 
 
@@ -799,6 +968,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="face overlay to start with (`v` cycles)",
     )
     parser.add_argument("--face-zoom", action="store_true", help="start with face auto-zoom (`z` toggles)")
+    parser.add_argument(
+        "--face-attributes", action="store_true", help="start with age/expression labels (`a` toggles)"
+    )
+    parser.add_argument(
+        "--face-attr-every", type=int, default=5, help="run the age/expression models every N frames"
+    )
+    parser.add_argument(
+        "--expression-model",
+        default=fa.default_expression_model_path(),
+        help="path to the ONNX facial-expression model",
+    )
+    parser.add_argument("--age-model", default=None, help="path to an optional ONNX age model")
     parser.add_argument("--face-model", default=ft.default_model_path(), help="path to the YuNet ONNX face model")
     parser.add_argument(
         "--face-detect-every", type=int, default=3, help="run face detection every N frames"
